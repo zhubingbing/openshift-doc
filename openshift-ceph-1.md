@@ -289,11 +289,463 @@ osd max object namespace len = 64
 
 ####  k8s（openshift）使用rbd
 
+为什么k8s需要RBD呢？以前用到的volume，有 configmap 、empty dir、hostpath，configmap通常是用来向容器注入配置的，而empty dir、hostpath 也能够用来存储数据，但他们都有一个致命的问题：如果容器被删除了，数据也就跟着丢失了。这对一些无状态应用来说没什么，因为他们的数据可能早就进数据库了，但对一些有状态的应用来说（比如说mysql），就是个问题了。
+
+Ceph RBD、Cephfs，都是解决这个问题的办法。
+
+Ceph RBD是个什么东西呢？
+
+我们知道，存储可以分为三类：对象存储（例如aws s3、aliyun oss）、文件存储（例如nfs、nas）、块存储。而Ceph RBD(RADOS Block Devices)即为块存储的一种，下文的Cephfs则是文件存储的一种。
+
+下面简要走一下ceph RBD的使用
+
 ##### rdb 用作 volume 挂载
+
+RBD基本使用：用户在Ceph上创建Pool（逻辑隔离），然后在Pool中创建image（实际存储介质 object），之后再将image挂载到本地服务器的某个目录上。
+
+下面常用几条命令就行了。
+
+```
+# rbd list    #列出默认pool下的image
+# rbd list -p k8s   #列出pool k8s下的image
+# rbd create foo -s 1024  #在默认pool中创建名为foo的image，大小为1024MB
+# rbd map foo #将ceph集群的image映射到本地的块设备, 正常给k8s或者openshift使用不需要map
+```
+
+Kubernetes的官方源码的examples/volumes/rbd目录下，就有一个使用cephrbd作为kubernetes pod volume的例子；
+
+例子提供了两个pod描述文件：rbd.json和rbd-with-secret.json。由于我们在ceph install时在ceph.conf中使用默认的安全验证协议cephx – The Ceph authentication protocol了：
+
+```
+auth_cluster_required = cephx
+auth_service_required = cephx
+auth_client_required = cephx
+```
+下面是例子volumes部分
+```
+"volumes": [
+            {
+                "name": "rbdpd",
+                "rbd": {
+                    "monitors": [
+                           "10.16.154.78:6789",
+                           "10.16.154.82:6789",
+                           "10.16.154.83:6789"
+                                 ],
+                    "pool": "kube",
+                    "image": "foo",
+                    "user": "admin",
+                    "secretRef": {
+                           "name": "ceph-secret"
+                                         },
+                    "fsType": "ext4",
+                    "readOnly": true
+                }
+```
+olumes部分是和ceph rbd紧密相关的一些信息，各个字段的大致含义如下：
+
+name：volume名字，这个没什么可说的，顾名思义即可。
+
+rbd.monitors：前面提到过ceph集群的monitor组件，这里填写monitor组件的通信信息，集群里有几个monitor就填几个；
+rbd.pool：Ceph中的pool记号，它用来给ceph中存储的对象进行逻辑分区用的。默认的pool是”rbd”；
+rbd.image：Ceph磁盘块设备映像文件；
+rbd.user：ceph client访问ceph storage cluster所使用的用户名。ceph有自己的一套user管理系统，user的写法通常是TYPE.ID，比如client.admin（是不是想到对应的文件：ceph.client.admin.keyring）。client是一种type，而admin则是user。一般来说，Type基本都是client。
+secret.Ref：引用的k8s secret对象名称。
+
+上面的字段中，有两个字段值我们无法提供：rbd.image和secret.Ref,我们在root用户下建立k8s-cephrbd工作目录，我们首先需要使用ceph提供的rbd工具创建Pod要用到image：
+上面都是在默认pool中做的，我们在k8s（openshift）里，当然要用自己的pool了。
+
+```
+# ceph osd lspools # 看看已经有那些pool
+# ceph osd pool create k8s 128 #创建pg_num 为128的名为k8s的pool
+# rados df
+
+# rbd list    #列出默认pool下的image
+# rbd list -p k8s   #列出pool k8s下的image
+
+#有了自己专属的 pool以后，创建image
+# rbd create foobar -s 1024 -p k8s #在k8s pool中创建名为foobar的image，大小为1024MB
+```
+另外给openshift使用不需要挂载image
+
+前面已经创建好了image foobar，给volume用简单直接挂就行了。
+
+接下来我们来创建ceph-secret这个k8s secret对象，这个secret对象用于k8s volume插件访问ceph集群：
+
+获取client.admin的keyring值，并用base64编码：
+
+```
+# ceph auth get-key client.admin
+AQBiKBxYuPXiJRAAsupnTBsURoWzb0k00oM3iQ==
+
+# echo "AQBiKBxYuPXiJRAAsupnTBsURoWzb0k00oM3iQ=="|base64
+QVFCaUtCeFl1UFhpSlJBQXN1cG5UQnNVUm9XemIwazAwb00zaVE9PQo=
+
+```
+在k8s-cephrbd下建立ceph-secret.yaml文件，data下的key字段值即为上面得到的编码值：
+
+```
+//ceph-secret.yaml
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ceph-secret
+data:
+  key: QVFCaUtCeFl1UFhpSlJBQXN1cG5UQnNVUm9XemIwazAwb00zaVE9PQo=
+```
+
+创建ceph-secret：
+
+```
+# kubectl create -f ceph-secret.yaml
+secret "ceph-secret" created
+
+# kubectl get secret
+NAME                  TYPE                                  DATA      AGE
+ceph-secret           Opaque                                1         16s
+```
+
+创建pod挂载volumes
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rbd
+spec:
+  containers:
+    - image: nginx
+      name: rbd-rw
+      volumeMounts:
+      - name: rbdpd
+        mountPath: /mnt/rbd
+  volumes:
+    - name: rbdpd
+      rbd:
+        monitors:
+        - '172.16.130.11:6789'
+        pool: k8s
+        image: foobar
+        fsType: ext4
+        readOnly: false
+        user: admin
+        //keyring: /etc/ceph/ceph.client.admin.keyring 
+        secretRef: {
+                        "name": "ceph-secret"
+                        },
+```
+
+创建成功可以看到如下信息：
+
+1. pod正常创建
+2. rbd正常挂载
+3. pod里面/mtn 正常挂载
+
+```
+
+[root@localhost ceph]# oc get pods
+NAME      READY     STATUS    RESTARTS   AGE
+rbd       1/1       Running   0          6m
+[root@localhost ceph]# mount | grep rbd
+/dev/rbd1 on /var/lib/origin/openshift.local.volumes/plugins/kubernetes.io/rbd/rbd/rbd-image-foo type ext4 (rw,relatime,stripe=1024,data=ordered)
+/dev/rbd1 on /var/lib/origin/openshift.local.volumes/pods/78f8f235-6ed6-11e8-aef5-0800272eeb78/volumes/kubernetes.io~rbd/rbdpd type ext4 (rw,relatime,stripe=1024,data=ordered)
+[root@localhost ceph]# oc get pods
+NAME      READY     STATUS    RESTARTS   AGE
+rbd       1/1       Running   0          6m
+[root@localhost ceph]# oc exec -it rbd bash
+root@rbd:/# df -h
+Filesystem           Size  Used Avail Use% Mounted on
+overlay               36G   17G   19G  49% /
+tmpfs                1.9G     0  1.9G   0% /dev
+tmpfs                1.9G     0  1.9G   0% /sys/fs/cgroup
+/dev/mapper/cl-root   36G   17G   19G  49% /etc/hosts
+/dev/rbd1            976M  1.3M  908M   1% /mnt/rbd
+shm                   64M     0   64M   0% /dev/shm
+tmpfs                1.9G   16K  1.9G   1% /run/secrets/kubernetes.io/serviceaccount
+tmpfs                1.9G     0  1.9G   0% /proc/scsi
+tmpfs                1.9G     0  1.9G   0% /sys/firmware
+```
+
+
+问题：
+map操作报错。不过从错误提示信息，我们能找到一些蛛丝马迹：“RBD image feature set mismatch”。ceph新版中在map image时，给image默认加上了许多feature，通过rbd info可以查看到：
+
+```
+# rbd info foo
+rbd image 'foo':
+    size 1024 MB in 256 objects
+    order 22 (4096 kB objects)
+    block_name_prefix: rbd_data.10612ae8944a
+    format: 2
+    features: layering, exclusive-lock, object-map, fast-diff, deep-flatten
+    flags:
+```
+可以看到foo image拥有： layering, exclusive-lock, object-map, fast-diff, deep-flatten。不过遗憾的是我的Ubuntu 16.04的内核仅支持其中的几个feature，其他feature概不支持。我们需要手动disable这些features：
+```
+# rbd feature disable foo exclusive-lock, object-map, fast-diff, deep-flatten
+root@node1:/var/log/ceph# rbd info foo
+rbd image 'foo':
+    size 1024 MB in 256 objects
+    order 22 (4096 kB objects)
+    block_name_prefix: rbd_data.10612ae8944a
+    format: 2
+    features: layering
+    flags:
+```
+不过每次这么来disable可是十分麻烦的，一劳永逸的方法是在各个cluster node的/etc/ceph/ceph.conf中加上这样一行配置：
+
+```
+rbd_default_features = 1 #仅是layering对应的bit码所对应的整数值
+```
+设置完后，通过下面命令查看配置变化：
+
+
+```
+# ceph --show-config|grep rbd|grep features
+rbd_default_features = 1
+```
+
 
 ##### rbd 用作 PV/PVC
 
+volume是一种比较初级的使用方式，中级的方式是使用PV/PVC。
+
+简单说说PV/PVC。集群管理员会创建多个PV（Persist Volume，持久化卷，不区分namespace），而普通用户会创建PVC（PV Claim，PV声明），k8s会从满足PVC的要求中选择一个PV来与该PVC绑定，之后再将PV对应的image挂载到容器中。
+
+来看个例子。
+
+先在rbd(默认) pool里创建一个名为pv的 image。
+
+```
+rbd create pv -s 1024
+```
+
+再创建一个PV，使用上面创建的image pv。
+
+```
+cat ceph-rbd-pv.yaml
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ceph-rbd-pv
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  rbd:
+    monitors:
+      - '1.2.3.4:6789'
+    pool: k8s
+    image: pv
+    user: admin
+    secretRef:
+      name: ceph-secret
+    fsType: ext4
+    readOnly: false
+  persistentVolumeReclaimPolicy: Recycle
+```
+
+看下现在pv的状态，还是 Available。
+```
+[root@localhost ceph]# oc create -f ceph-rdb-pv.yaml
+persistentvolume "ceph-rbd-pv" created
+[root@localhost ceph]# oc get pv
+NAME          CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS      CLAIM     STORAGECLASS   REASON    AGE
+ceph-rbd-pv   1Gi        RWO            Recycle          Available                                      4s
+```
+创建一个PVC，要求一块1G的存储。
+
+```
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ceph-rbd-pv-claim
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+```
+因为上面已经创建满足要求的PV了，可以看到pvc和pv的状态都已经是Bound了。
+
+```
+[root@localhost ceph]# oc get pv
+NAME          CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS    CLAIM                                   STORAGECLASS   REASON    AGE
+ceph-rbd-pv   1Gi        RWO            Recycle          Bound     openshift-ansible-service-broker/etcd                            2m
+```
+
 ##### rdb 用作 storage class
 
+为什么前面说PV/PVC是一个“中级”解决方案呢？
+
+很简单啊，管理员不可能没事就等着给人创建RBD image、PV，而一次创建大量PV等着人用又显得很不云计算
+
+简单来说，storage创建需要的材料，只需要访问ceph RBD的IP/Port、用户名、keyring、pool，不需要提前创建image；当用户创建一个PVC时，k8s查找是否有符合PVC请求的storage class类型，如果有，则依次：
+
+	1. 到ceph集群上创建image
+	2. 创建一个PV，名字为pvc-xx-xxx-xxx，大小pvc请求的storage。
+	3. 将上面的PV与PVC绑定，格式化后挂到容器中
+
+是不是很简单？管理员只要创建好storage class就行了，后面的事情用户自己就可以搞定了。当然了，为了防止流氓用户，设置一下Resource Quota还是很有必要的。
+
+先创建一个SC。根PV一样，SC也是集群范围的（RBD认为是fast的）。
+
+```
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: fast
+provisioner: kubernetes.io/rbd
+parameters:
+  monitors: 172.16.130.11:6789
+  adminId: admin
+  adminSecretName: ceph-secret
+  adminSecretNamespace: test
+  pool: rbd
+  userId: admin
+  userSecretName: ceph-secret
+  fsType: ext4
+  imageFormat: "1"
+  imageFeatures: "layering"
+```
+
+之后创建应用的时候，需要同时创建 pvc+pod，二者通过claimName关联。pvc中需要指定其storageClassName为上面创建的sc的name（即fast）
+
+```
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: test
+spec:
+  accessModes:
+    - ReadWriteOnce
+  volumeMode: Filesystem
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: fast
+
+```
+创建完可以看到pv,pvc,sc完成完美绑定
+
+```
+[root@localhost ceph]# oc get pvc
+^[[ANAME              STATUS    VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+rbd-pvc-pod-pvc   Bound     pvc-d98e98c5-6ee5-11e8-aef5-0800272eeb78   1Gi        RWO            dynamic        17m
+test              Bound     pvc-a84a145e-6ee6-11e8-aef5-0800272eeb78   1Gi        RWO            fast           11m
+[root@localhost ceph]# oc get pv
+NAME                                       CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS    CLAIM                                   STORAGECLASS   REASON    AGE
+ceph-rbd-pv                                1Gi        RWO            Recycle          Bound     openshift-ansible-service-broker/etcd                            1h
+pvc-a84a145e-6ee6-11e8-aef5-0800272eeb78   1Gi        RWO            Delete           Bound     test/test                               fast                     11m
+pvc-d98e98c5-6ee5-11e8-aef5-0800272eeb78   1Gi        RWO            Delete           Bound     test/rbd-pvc-pod-pvc                    dynamic                  17m
+[root@localhost ceph]# oc get sc
+NAME                PROVISIONER         AGE
+dynamic (default)   kubernetes.io/rbd   18m
+fast                kubernetes.io/rbd   12
+```
+
+在ceph集群可以看到image（object）创建成功
+```
+root@node1:~/my-cluster# rbd list
+kubernetes-dynamic-pvc-a84d82d6-6ee6-11e8-b584-0800272eeb78
+kubernetes-dynamic-pvc-d991e392-6ee5-11e8-b584-0800272eeb78
+foo
+pv
+pvs
+```
+
+遇到问题：
+
+1. secret  获取不到
+```
+povision volume with StorageClass "fast": failed to get admin secret from ["test"/"ceph-secret"]: failed to get secret from ["test"/"ceph-secret"]
+```
+解决方案，把secret创建到指定的namespaces下面
+
+2. rbd 调用命令失败
+
+```
+rbd: extraneous parameter --image-feature
+  Warning  ProvisioningFailed  8s  persistentvolume-controller  Failed to provision volume with StorageClass "dynamic": failed to create rbd image: exit status 1, 
+
+```
+解决方案: 把sc imageFormat改成1就ok。
+原因： openshit 默认装的ceph太老了，把ceph升级到
+
+下面是我openshift环境
+```
+[root@localhost ceph]# oc version
+oc v3.9.0+ba7faec-1
+kubernetes v1.9.1+a0ce1bc657
+features: Basic-Auth GSSAPI Kerberos SPNEGO
+
+Server https://192.168.1.90:8443
+openshift v3.9.0+ba7faec-1
+kubernetes v1.9.1+a0ce1bc657
+[root@localhost ceph]# rbd version
+2018-06-13 04:57:58.195065 7f9b6c3c47c0 -1 did not load config file, using default settings.
+rbd: error parsing command 'version'; -h or --help for usage
+[root@localhost ceph]# rbd --version
+ceph version 0.94.5 (9764da52395923e0b32908d83a9f7304401fee43)
+```
+下面是我们ceph集群的环境
+```
+root@node1:~/my-cluster# ceph --version
+ceph version 10.2.9 (2ee413f77150c0f375ff6f10edd6c8f9c7d060d0)
+```
+发现版本不一致，而且openshift中的ceph环境太老了
+
+
 ##### 使用StatefulSet解决多副本的问题
+
+下面使用StatefulSet创建多副本
+
+```
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nginx
+spec:
+  selector:
+    matchLabels:
+      app: nginx
+  serviceName: "nginx"
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+      - name: nginx
+        image: nginx
+        volumeMounts:
+        - name: www
+          mountPath: /usr/share/nginx/html
+  volumeClaimTemplates:
+  - metadata:
+      name: www
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "fast"
+      resources:
+        requests:
+          storage: 1Gi
+```
+此时去看PVC，可以看到创建了3个PVC。
+
+```
+[root@localhost ceph]# oc get pvc | grep www
+www-nginx-0       Bound     pvc-2422b493-6ee9-11e8-aef5-0800272eeb78   1Gi        RWO            fast           4m
+www-nginx-1       Bound     pvc-62291d14-6ee9-11e8-aef5-0800272eeb78   1Gi        RWO            fast           2m
+[root@localhost ceph]# oc get pvc | grep www
+www-nginx-0       Bound     pvc-2422b493-6ee9-11e8-aef5-0800272eeb78   1Gi        RWO            fast           4m
+www-nginx-1       Bound     pvc-62291d14-6ee9-11e8-aef5-0800272eeb78   1Gi        RWO            fast           2m
+
+```
+
 
